@@ -16,8 +16,10 @@ All notable changes to this project are documented in this file. The format is b
   actions; `Execution` covers every DDI execution status, so a device can reject a cancel or finish a
   download-only action with `Downloaded`.
 - Target attributes, sent on the first poll and whenever hawkBit asks again.
-- Links returned by the server are only followed when they point below the base URL, and
-  `Token`'s `Debug` output hides the secret.
+- Links returned by the server are followed on the base URL's scheme and host only, keeping just
+  their path, so the token never leaves that host; `Token`'s `Debug` output hides the secret.
+- `DeploymentBase::version` and `bundle_url` for single-module deployments; they return `None`
+  rather than guess between several chunks or artifacts, and `bundle_url` only returns https.
 - `DdiClient::with_agent` to supply a custom `ureq::Agent`, for example to trust a private CA.
 - Serde models for the deployment base resource: `DeploymentBase`, `Deployment` (with its
   download/update `Handling` and `MaintenanceWindow`), `Chunk`, `Artifact` (with filename, size and

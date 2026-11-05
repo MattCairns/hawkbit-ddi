@@ -161,21 +161,27 @@ pub struct ArtifactLinks {
 }
 
 impl DeploymentBase {
-    /// Download URL of the first artifact, preferring https.
+    /// HTTPS download URL of the deployment's only artifact. `None` when there is no https link or
+    /// more than one chunk or artifact; then read [`Deployment::chunks`] instead.
     #[must_use]
     pub fn bundle_url(&self) -> Option<&str> {
-        let links = &self.deployment.chunks.first()?.artifacts.first()?.links;
-        links
-            .download
-            .as_ref()
-            .or(links.download_http.as_ref())
-            .map(|l| l.href.as_str())
+        let [artifact] = self.only_chunk()?.artifacts.as_slice() else {
+            return None;
+        };
+        Some(&artifact.links.download.as_ref()?.href)
     }
 
-    /// Version of the first chunk.
+    /// Version of the deployment's only chunk. `None` when there are several.
     #[must_use]
     pub fn version(&self) -> Option<&str> {
-        Some(&self.deployment.chunks.first()?.version)
+        Some(&self.only_chunk()?.version)
+    }
+
+    fn only_chunk(&self) -> Option<&Chunk> {
+        match self.deployment.chunks.as_slice() {
+            [chunk] => Some(chunk),
+            _ => None,
+        }
     }
 }
 
@@ -301,15 +307,16 @@ impl DdiClient {
             .read_json()
     }
 
-    /// `href` from the server, if it points below `base_url`, so the token never goes to another
-    /// host or over plain http.
-    fn trusted<'a>(&self, href: &'a str) -> Result<&'a str, ureq::Error> {
-        match href.strip_prefix(&self.base_url) {
-            Some(rest) if rest.starts_with('/') => Ok(href),
-            _ => Err(ureq::Error::BadUri(format!(
-                "hawkBit link {href} is outside {}",
-                self.base_url
-            ))),
+    /// The path of `href` from the server on `base_url`'s scheme and host, so the token never
+    /// goes to another host or over plain http, even when hawkBit spells its own address
+    /// differently (a port, letter case, or `http` behind a TLS proxy).
+    fn on_base(&self, href: &str) -> Result<String, ureq::Error> {
+        let bad = || ureq::Error::BadUri(format!("hawkBit link {href} or {}", self.base_url));
+        let href: ureq::http::Uri = href.parse().map_err(|_| bad())?;
+        let base: ureq::http::Uri = self.base_url.parse().map_err(|_| bad())?;
+        match (base.scheme_str(), base.authority(), href.path_and_query()) {
+            (Some(scheme), Some(host), Some(path)) => Ok(format!("{scheme}://{host}{path}")),
+            _ => Err(bad()),
         }
     }
 
@@ -335,10 +342,10 @@ impl DdiClient {
         };
         let action = if let Some(href) = link("cancelAction") {
             Some(Action::Cancel(
-                self.get_json::<CancelAction>(self.trusted(href)?)?.id,
+                self.get_json::<CancelAction>(&self.on_base(href)?)?.id,
             ))
         } else if let Some(href) = link("deploymentBase") {
-            Some(Action::Deploy(self.get_json(self.trusted(href)?)?))
+            Some(Action::Deploy(self.get_json(&self.on_base(href)?)?))
         } else {
             None
         };
@@ -576,23 +583,50 @@ mod tests {
     }
 
     #[test]
-    fn poll_refuses_links_outside_base_url() {
+    fn poll_follows_links_on_base_url_only() {
         let mut server = Server::new();
-        let base = server.url();
-        let plain = base.replacen("http://", "ftp://", 1);
-        for href in [
-            format!("{plain}/t/controller/v1/u-verdin/deploymentBase/5"),
-            format!("{base}.evil.com/t/controller/v1/u-verdin/deploymentBase/5"),
+        let api = DdiClient::new(&server.url(), "t", Token::GatewayToken("tok".into()));
+        for (rel, path, body) in [
+            ("cancelAction", "cancelAction/27", r#"{"id":"27"}"#),
+            (
+                "deploymentBase",
+                "deploymentBase/5",
+                r#"{"id":"5","deployment":{"download":"forced","update":"forced","chunks":[]}}"#,
+            ),
         ] {
+            let path = format!("/t/controller/v1/u-verdin/{path}");
             let _p = server
                 .mock("GET", "/t/controller/v1/u-verdin")
                 .with_body(format!(
-                    r#"{{"_links":{{"deploymentBase":{{"href":"{href}"}}}}}}"#
+                    r#"{{"_links":{{"{rel}":{{"href":"https://evil.example:8443{path}"}}}}}}"#
                 ))
                 .create();
-            let api = DdiClient::new(&base, "t", Token::GatewayToken("tok".into()));
-            assert!(matches!(api.poll("u-verdin"), Err(ureq::Error::BadUri(_))));
+            let followed = server
+                .mock("GET", path.as_str())
+                .match_header("authorization", "GatewayToken tok")
+                .with_body(body)
+                .create();
+            assert!(api.poll("u-verdin").unwrap().action.is_some());
+            followed.assert();
         }
+    }
+
+    #[test]
+    fn helpers_refuse_to_guess_between_chunks() {
+        let chunk = |v: &str| Chunk {
+            version: v.into(),
+            artifacts: vec![],
+        };
+        let d = DeploymentBase {
+            id: "5".into(),
+            deployment: Deployment {
+                download: Handling::Forced,
+                update: Handling::Forced,
+                maintenance_window: None,
+                chunks: vec![chunk("os-1"), chunk("app-2")],
+            },
+        };
+        assert_eq!((d.version(), d.bundle_url()), (None, None));
     }
 
     #[test]
