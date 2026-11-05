@@ -37,13 +37,23 @@ pub struct DdiClient {
 }
 
 /// DDI credentials, deserialized from `{"gateway_token": ...}` or `{"target_token": ...}`.
-#[derive(Debug, Deserialize)]
+/// `Debug` hides the secret.
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Token {
     /// Tenant-wide gateway security token.
     GatewayToken(String),
     /// Security token of a single target (device).
     TargetToken(String),
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Token::GatewayToken(_) => "GatewayToken(***)",
+            Token::TargetToken(_) => "TargetToken(***)",
+        })
+    }
 }
 
 /// A HAL link.
@@ -190,8 +200,28 @@ impl DdiClient {
             .read_json()
     }
 
+    /// `href` from the server, if it points below `base_url`, so the token never goes to another
+    /// host or over plain http.
+    fn trusted<'a>(&self, href: &'a str) -> Result<&'a str, ureq::Error> {
+        match href.strip_prefix(&self.base_url) {
+            Some(rest) if rest.starts_with('/') => Ok(href),
+            _ => Err(ureq::Error::BadUri(format!(
+                "hawkBit link {href} is outside {}",
+                self.base_url
+            ))),
+        }
+    }
+
+    fn feedback_url(&self, controller_id: &str, action_id: &str) -> String {
+        format!(
+            "{}/{}/controller/v1/{controller_id}/deploymentBase/{action_id}/feedback",
+            self.base_url, self.tenant
+        )
+    }
+
     /// The pending deployment for this controller, if any. A cancel request is accepted first, since
-    /// hawkBit holds back newer actions until it is; the next poll then sees them.
+    /// hawkBit holds back newer actions until it is; the next poll then sees them. Links from the
+    /// server must point below `base_url`, or this returns [`ureq::Error::BadUri`].
     pub fn pending(&self, controller_id: &str) -> Result<Option<DeploymentBase>, ureq::Error> {
         let url = format!(
             "{}/{}/controller/v1/{controller_id}",
@@ -205,7 +235,7 @@ impl DdiClient {
         {
             tracing::info!(href, "accepting hawkBit cancel");
             self.post_status(
-                &format!("{href}/feedback"),
+                &format!("{}/feedback", self.trusted(href)?),
                 Execution::Closed,
                 Finished::Success,
                 &["cancelled"],
@@ -215,7 +245,7 @@ impl DdiClient {
         }
         poll.pointer("/_links/deploymentBase/href")
             .and_then(serde_json::Value::as_str)
-            .map(|href| self.get_json(href))
+            .map(|href| self.get_json(self.trusted(href)?))
             .transpose()
     }
 
@@ -228,11 +258,13 @@ impl DdiClient {
         finished: Finished,
         details: &[&str],
     ) -> Result<(), ureq::Error> {
-        let url = format!(
-            "{}/{}/controller/v1/{controller_id}/deploymentBase/{action_id}/feedback",
-            self.base_url, self.tenant
-        );
-        self.post_status(&url, execution, finished, details, None)
+        self.post_status(
+            &self.feedback_url(controller_id, action_id),
+            execution,
+            finished,
+            details,
+            None,
+        )
     }
 
     /// Reports `percent` done on this controller's still-running action `action_id`.
@@ -243,12 +275,8 @@ impl DdiClient {
         percent: u32,
         detail: &str,
     ) -> Result<(), ureq::Error> {
-        let url = format!(
-            "{}/{}/controller/v1/{controller_id}/deploymentBase/{action_id}/feedback",
-            self.base_url, self.tenant
-        );
         self.post_status(
-            &url,
+            &self.feedback_url(controller_id, action_id),
             Execution::Proceeding,
             Finished::None,
             &[detail],
@@ -405,6 +433,35 @@ mod tests {
             .create();
         api.pending("u-verdin").unwrap();
         put.assert();
+    }
+
+    #[test]
+    fn pending_refuses_links_outside_base_url() {
+        let mut server = Server::new();
+        let base = server.url();
+        let plain = base.replacen("http://", "ftp://", 1);
+        for href in [
+            format!("{plain}/t/controller/v1/u-verdin/deploymentBase/5"),
+            format!("{base}.evil.com/t/controller/v1/u-verdin/deploymentBase/5"),
+        ] {
+            let _p = server
+                .mock("GET", "/t/controller/v1/u-verdin")
+                .with_body(format!(
+                    r#"{{"_links":{{"deploymentBase":{{"href":"{href}"}}}}}}"#
+                ))
+                .create();
+            let api = DdiClient::new(&base, "t", Token::GatewayToken("tok".into()));
+            assert!(matches!(
+                api.pending("u-verdin"),
+                Err(ureq::Error::BadUri(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn token_debug_hides_the_secret() {
+        let debug = format!("{:?}", Token::TargetToken("tok".into()));
+        assert_eq!(debug, "TargetToken(***)");
     }
 
     #[test]
