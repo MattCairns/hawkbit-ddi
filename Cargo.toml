@@ -7,6 +7,7 @@ description = "Blocking client for the Eclipse hawkBit Direct Device Integration
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/MattCairns/hawkbit-ddi"
 readme = "README.md"
+exclude = ["flake.nix", "flake.lock"]
 keywords = ["hawkbit", "ota", "ddi", "iot", "update"]
 categories = ["api-bindings", "embedded", "network-programming"]
 authors = ["Matthew Cairns <matthew@openoceanrobotics.com>"]
