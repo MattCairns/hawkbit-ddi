@@ -3,17 +3,25 @@
 //! `TargetToken`.
 //!
 //! ```no_run
-//! use hawkbit_ddi::{DdiClient, Execution, Finished, Token};
+//! use hawkbit_ddi::{Action, DdiClient, Execution, Finished, Token};
 //!
 //! let client = DdiClient::new(
 //!     "https://hawkbit.example.com",
 //!     "DEFAULT",
 //!     Token::TargetToken("secret".into()),
 //! );
-//! if let Some(deployment) = client.pending("my-device")? {
-//!     println!("update to {:?} from {:?}", deployment.version(), deployment.bundle_url());
-//!     client.feedback("my-device", &deployment.id, Execution::Closed, Finished::Success, &[])?;
+//! let poll = client.poll("my-device")?;
+//! match poll.action {
+//!     Some(Action::Deploy(deployment)) => {
+//!         println!("update to {:?} from {:?}", deployment.version(), deployment.bundle_url());
+//!         client.feedback("my-device", &deployment.id, Execution::Closed, Finished::Success, &[])?;
+//!     }
+//!     Some(Action::Cancel(id)) => {
+//!         client.cancel_feedback("my-device", &id, Execution::Closed, Finished::Success, &[])?;
+//!     }
+//!     None => {}
 //! }
+//! std::thread::sleep(poll.sleep.unwrap_or(std::time::Duration::from_secs(300)));
 //! # Ok::<(), ureq::Error>(())
 //! ```
 #![deny(missing_docs)]
@@ -72,11 +80,40 @@ pub struct DeploymentBase {
     pub deployment: Deployment,
 }
 
-/// The software modules of a deployment.
+/// The software modules of a deployment, and how to handle them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Deployment {
+    /// Whether to download the artifacts.
+    pub download: Handling,
+    /// Whether to install the artifacts. `Skip` means download only.
+    pub update: Handling,
+    /// Set when the action has a maintenance window: install only while it is `Available`.
+    pub maintenance_window: Option<MaintenanceWindow>,
     /// One chunk per software module.
     pub chunks: Vec<Chunk>,
+}
+
+/// How a step of a deployment is to be handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Handling {
+    /// Do not perform the step.
+    Skip,
+    /// Perform the step if the device sees fit (soft update).
+    Attempt,
+    /// Perform the step now.
+    Forced,
+}
+
+/// Whether the action's maintenance window is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MaintenanceWindow {
+    /// The window is open; installing is allowed.
+    Available,
+    /// The window is closed; wait before installing.
+    Unavailable,
 }
 
 /// A software module to deploy.
@@ -91,9 +128,26 @@ pub struct Chunk {
 /// A downloadable file of a software module.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
+    /// File name of the artifact.
+    pub filename: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// Checksums, to verify the download.
+    pub hashes: Hashes,
     /// Download links of the artifact.
     #[serde(rename = "_links")]
     pub links: ArtifactLinks,
+}
+
+/// Hex-encoded checksums of an artifact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Hashes {
+    /// SHA-1 checksum.
+    pub sha1: String,
+    /// MD5 checksum.
+    pub md5: String,
+    /// SHA-256 checksum, sent by hawkBit 0.3 and later.
+    pub sha256: Option<String>,
 }
 
 /// Download links of an artifact.
@@ -133,6 +187,18 @@ pub enum Execution {
     Proceeding,
     /// The action is done.
     Closed,
+    /// The action was cancelled.
+    Canceled,
+    /// The device rejected the action, for example a cancel it cannot honour.
+    Rejected,
+    /// The action is scheduled for later.
+    Scheduled,
+    /// The action resumed, for example after a reboot.
+    Resumed,
+    /// The artifacts are downloading.
+    Download,
+    /// The artifacts are downloaded; ends a download-only action.
+    Downloaded,
 }
 
 /// Result of an action, as reported in feedback.
@@ -145,6 +211,41 @@ pub enum Finished {
     Failure,
     /// No result yet.
     None,
+}
+
+/// Result of polling a controller.
+#[derive(Debug, Clone)]
+pub struct Poll {
+    /// How long hawkBit wants the device to wait before polling again, if it said.
+    pub sleep: Option<Duration>,
+    /// What hawkBit wants the device to do, if anything.
+    pub action: Option<Action>,
+}
+
+/// An open action for the device.
+#[derive(Debug, Clone)]
+pub enum Action {
+    /// Deploy this. Report with [`DdiClient::feedback`] and [`DdiClient::progress`].
+    Deploy(DeploymentBase),
+    /// Cancel the action with this id. Answer with [`DdiClient::cancel_feedback`]; hawkBit holds
+    /// back newer actions until you do.
+    Cancel(String),
+}
+
+#[derive(Deserialize)]
+struct CancelAction {
+    id: String,
+}
+
+/// Parses hawkBit's `HH:MM:SS` polling interval.
+fn parse_sleep(s: &str) -> Option<Duration> {
+    let mut parts = s.split(':').map(str::parse::<u64>);
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(h)), Some(Ok(m)), Some(Ok(s)), None) => {
+            Some(Duration::from_secs(h * 3600 + m * 60 + s))
+        }
+        _ => None,
+    }
 }
 
 impl DdiClient {
@@ -212,41 +313,36 @@ impl DdiClient {
         }
     }
 
-    fn feedback_url(&self, controller_id: &str, action_id: &str) -> String {
+    fn controller_url(&self, controller_id: &str, path: &str) -> String {
         format!(
-            "{}/{}/controller/v1/{controller_id}/deploymentBase/{action_id}/feedback",
+            "{}/{}/controller/v1/{controller_id}{path}",
             self.base_url, self.tenant
         )
     }
 
-    /// The pending deployment for this controller, if any. A cancel request is accepted first, since
-    /// hawkBit holds back newer actions until it is; the next poll then sees them. Links from the
-    /// server must point below `base_url`, or this returns [`ureq::Error::BadUri`].
-    pub fn pending(&self, controller_id: &str) -> Result<Option<DeploymentBase>, ureq::Error> {
-        let url = format!(
-            "{}/{}/controller/v1/{controller_id}",
-            self.base_url, self.tenant
-        );
-        let poll: serde_json::Value = self.get_json(&url)?;
+    /// Polls this controller for its open action and the interval until the next poll. Also
+    /// reports the target attributes when due.
+    pub fn poll(&self, controller_id: &str) -> Result<Poll, ureq::Error> {
+        let poll: serde_json::Value = self.get_json(&self.controller_url(controller_id, ""))?;
         self.report_attributes(controller_id, poll.pointer("/_links/configData").is_some());
-        if let Some(href) = poll
-            .pointer("/_links/cancelAction/href")
+        let sleep = poll
+            .pointer("/config/polling/sleep")
             .and_then(serde_json::Value::as_str)
-        {
-            tracing::info!(href, "accepting hawkBit cancel");
-            self.post_status(
-                &format!("{}/feedback", self.trusted(href)?),
-                Execution::Closed,
-                Finished::Success,
-                &["cancelled"],
-                None,
-            )?;
-            return Ok(None);
-        }
-        poll.pointer("/_links/deploymentBase/href")
-            .and_then(serde_json::Value::as_str)
-            .map(|href| self.get_json(self.trusted(href)?))
-            .transpose()
+            .and_then(parse_sleep);
+        let link = |name: &str| {
+            poll.pointer(&format!("/_links/{name}/href"))
+                .and_then(serde_json::Value::as_str)
+        };
+        let action = if let Some(href) = link("cancelAction") {
+            Some(Action::Cancel(
+                self.get_json::<CancelAction>(self.trusted(href)?)?.id,
+            ))
+        } else if let Some(href) = link("deploymentBase") {
+            Some(Action::Deploy(self.get_json(self.trusted(href)?)?))
+        } else {
+            None
+        };
+        Ok(Poll { sleep, action })
     }
 
     /// Reports the progress of this controller's action `action_id`.
@@ -258,13 +354,28 @@ impl DdiClient {
         finished: Finished,
         details: &[&str],
     ) -> Result<(), ureq::Error> {
-        self.post_status(
-            &self.feedback_url(controller_id, action_id),
-            execution,
-            finished,
-            details,
-            None,
-        )
+        let url = self.controller_url(
+            controller_id,
+            &format!("/deploymentBase/{action_id}/feedback"),
+        );
+        self.post_status(&url, execution, finished, details, None)
+    }
+
+    /// Answers the cancel request for action `action_id`: `Closed` with `Success` accepts it,
+    /// `Rejected` refuses it, for example when the install is too far along to stop.
+    pub fn cancel_feedback(
+        &self,
+        controller_id: &str,
+        action_id: &str,
+        execution: Execution,
+        finished: Finished,
+        details: &[&str],
+    ) -> Result<(), ureq::Error> {
+        let url = self.controller_url(
+            controller_id,
+            &format!("/cancelAction/{action_id}/feedback"),
+        );
+        self.post_status(&url, execution, finished, details, None)
     }
 
     /// Reports `percent` done on this controller's still-running action `action_id`.
@@ -275,8 +386,12 @@ impl DdiClient {
         percent: u32,
         detail: &str,
     ) -> Result<(), ureq::Error> {
+        let url = self.controller_url(
+            controller_id,
+            &format!("/deploymentBase/{action_id}/feedback"),
+        );
         self.post_status(
-            &self.feedback_url(controller_id, action_id),
+            &url,
             Execution::Proceeding,
             Finished::None,
             &[detail],
@@ -290,11 +405,7 @@ impl DdiClient {
         if self.attributes.is_empty() || (self.attributes_sent.load(Ordering::Relaxed) && !asked) {
             return;
         }
-        let url = format!(
-            "{}/{}/controller/v1/{controller_id}/configData",
-            self.base_url, self.tenant
-        );
-        match self.put_attributes(&url) {
+        match self.put_attributes(&self.controller_url(controller_id, "/configData")) {
             Ok(()) => self.attributes_sent.store(true, Ordering::Relaxed),
             Err(e) => tracing::warn!(error = %e, "reporting attributes to hawkBit"),
         }
@@ -340,7 +451,7 @@ mod tests {
     use mockito::{Matcher, Server};
 
     #[test]
-    fn pending_follows_the_deployment_link() {
+    fn poll_follows_the_deployment_link() {
         let mut server = Server::new();
         let href = format!(
             "{}/t/controller/v1/u-jetson/deploymentBase/5?c=1",
@@ -357,33 +468,51 @@ mod tests {
             .mock("GET", "/t/controller/v1/u-jetson/deploymentBase/5")
             .match_query(Matcher::UrlEncoded("c".into(), "1".into()))
             .with_body(
-                r#"{"id":"5","deployment":{"download":"forced","update":"forced","chunks":[
+                r#"{"id":"5","deployment":{"download":"forced","update":"skip",
+                    "maintenanceWindow":"unavailable","chunks":[
                     {"part":"os","name":"jetson","version":"20261030-abc1234","artifacts":[
-                        {"filename":"b.raucb","size":3,"hashes":{"sha256":"x"},"_links":{
+                        {"filename":"b.raucb","size":3,"hashes":{"sha1":"s","md5":"m","sha256":"x"},"_links":{
                             "download":{"href":"https://h/b.raucb"},
                             "download-http":{"href":"http://h/b.raucb"}}}]}]}}"#,
             )
             .create();
         let api = DdiClient::new(&server.url(), "t", Token::GatewayToken("tok".into()));
-        let d = api.pending("u-jetson").unwrap().unwrap();
+        let poll = api.poll("u-jetson").unwrap();
+        assert_eq!(poll.sleep, Some(Duration::from_secs(300)));
+        let Some(Action::Deploy(d)) = poll.action else {
+            panic!("expected a deployment, got {:?}", poll.action)
+        };
         assert_eq!(d.id, "5");
+        assert_eq!(d.deployment.update, Handling::Skip);
+        assert_eq!(
+            d.deployment.maintenance_window,
+            Some(MaintenanceWindow::Unavailable)
+        );
+        let artifact = &d.deployment.chunks[0].artifacts[0];
+        assert_eq!((artifact.filename.as_str(), artifact.size), ("b.raucb", 3));
+        assert_eq!(artifact.hashes.sha256.as_deref(), Some("x"));
         assert_eq!(d.deployment.chunks[0].version, "20261030-abc1234");
         assert_eq!(d.bundle_url(), Some("https://h/b.raucb"));
     }
 
     #[test]
-    fn pending_without_action_is_none() {
+    fn poll_without_action_is_none() {
         let mut server = Server::new();
         let _m = server
             .mock("GET", "/t/controller/v1/u-verdin")
-            .with_body(r#"{"config":{"polling":{"sleep":"00:05:00"}},"_links":{}}"#)
+            .with_body(r#"{"config":{"polling":{"sleep":"12:34:56"}},"_links":{}}"#)
             .create();
         let api = DdiClient::new(&server.url(), "t", Token::GatewayToken("tok".into()));
-        assert!(api.pending("u-verdin").unwrap().is_none());
+        let poll = api.poll("u-verdin").unwrap();
+        assert!(poll.action.is_none());
+        assert_eq!(
+            poll.sleep,
+            Some(Duration::from_secs(12 * 3600 + 34 * 60 + 56))
+        );
     }
 
     #[test]
-    fn pending_accepts_a_cancel() {
+    fn poll_returns_a_cancel_and_cancel_feedback_answers_it() {
         let mut server = Server::new();
         let href = format!("{}/t/controller/v1/u-verdin/cancelAction/27", server.url());
         let _p = server
@@ -392,20 +521,31 @@ mod tests {
                 r#"{{"_links":{{"cancelAction":{{"href":"{href}"}}}}}}"#
             ))
             .create();
-        let ack = server
+        let _c = server
+            .mock("GET", "/t/controller/v1/u-verdin/cancelAction/27")
+            .with_body(r#"{"id":"27","cancelAction":{"stopId":"27"}}"#)
+            .create();
+        let reject = server
             .mock("POST", "/t/controller/v1/u-verdin/cancelAction/27/feedback")
             .match_header("authorization", "TargetToken tok")
             .match_body(Matcher::PartialJson(serde_json::json!({
-                "status": {"execution": "closed", "result": {"finished": "success"}}
+                "status": {"execution": "rejected", "result": {"finished": "none"}}
             })))
             .create();
         let api = DdiClient::new(&server.url(), "t", Token::TargetToken("tok".into()));
-        assert!(api.pending("u-verdin").unwrap().is_none());
-        ack.assert();
+        let poll = api.poll("u-verdin").unwrap();
+        assert!(poll.sleep.is_none());
+        let Some(Action::Cancel(id)) = poll.action else {
+            panic!("expected a cancel, got {:?}", poll.action)
+        };
+        assert_eq!(id, "27");
+        api.cancel_feedback("u-verdin", &id, Execution::Rejected, Finished::None, &[])
+            .unwrap();
+        reject.assert();
     }
 
     #[test]
-    fn pending_reports_attributes_once_until_asked_again() {
+    fn poll_reports_attributes_once_until_asked_again() {
         let mut server = Server::new();
         let poll = |links: &str| format!(r#"{{"_links":{{{links}}}}}"#);
         let quiet = server
@@ -423,20 +563,20 @@ mod tests {
             .create();
         let api = DdiClient::new(&server.url(), "t", Token::TargetToken("tok".into()))
             .with_attributes(BTreeMap::from([("rauc.compatible".into(), "c".into())]));
-        api.pending("u-verdin").unwrap();
-        api.pending("u-verdin").unwrap();
+        api.poll("u-verdin").unwrap();
+        api.poll("u-verdin").unwrap();
         quiet.assert();
         let href = format!("{}/t/controller/v1/u-verdin/configData", server.url());
         let _asking = server
             .mock("GET", "/t/controller/v1/u-verdin")
             .with_body(poll(&format!(r#""configData":{{"href":"{href}"}}"#)))
             .create();
-        api.pending("u-verdin").unwrap();
+        api.poll("u-verdin").unwrap();
         put.assert();
     }
 
     #[test]
-    fn pending_refuses_links_outside_base_url() {
+    fn poll_refuses_links_outside_base_url() {
         let mut server = Server::new();
         let base = server.url();
         let plain = base.replacen("http://", "ftp://", 1);
@@ -451,10 +591,7 @@ mod tests {
                 ))
                 .create();
             let api = DdiClient::new(&base, "t", Token::GatewayToken("tok".into()));
-            assert!(matches!(
-                api.pending("u-verdin"),
-                Err(ureq::Error::BadUri(_))
-            ));
+            assert!(matches!(api.poll("u-verdin"), Err(ureq::Error::BadUri(_))));
         }
     }
 
@@ -465,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_maps_unauthorized() {
+    fn poll_maps_unauthorized() {
         let mut server = Server::new();
         let _m = server
             .mock("GET", "/t/controller/v1/u-verdin")
@@ -473,7 +610,7 @@ mod tests {
             .create();
         let api = DdiClient::new(&server.url(), "t", Token::GatewayToken("tok".into()));
         assert!(matches!(
-            api.pending("u-verdin"),
+            api.poll("u-verdin"),
             Err(ureq::Error::StatusCode(401))
         ));
     }
