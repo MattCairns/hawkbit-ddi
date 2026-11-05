@@ -16,7 +16,7 @@ let client = DdiClient::new(
 let poll = client.poll("my-device")?;
 match poll.action {
     Some(Action::Deploy(deployment)) => {
-        println!("update to {:?} from {:?}", deployment.version(), deployment.bundle_url());
+        println!("update to {:?} from {:?}", deployment.version(), deployment.bundle_url(".raucb"));
         client.feedback("my-device", &deployment.id, Execution::Closed, Finished::Success, &[])?;
     }
     Some(Action::Cancel(id)) => {

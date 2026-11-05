@@ -13,7 +13,7 @@
 //! let poll = client.poll("my-device")?;
 //! match poll.action {
 //!     Some(Action::Deploy(deployment)) => {
-//!         println!("update to {:?} from {:?}", deployment.version(), deployment.bundle_url());
+//!         println!("update to {:?} from {:?}", deployment.version(), deployment.bundle_url(".raucb"));
 //!         client.feedback("my-device", &deployment.id, Execution::Closed, Finished::Success, &[])?;
 //!     }
 //!     Some(Action::Cancel(id)) => {
@@ -161,14 +161,18 @@ pub struct ArtifactLinks {
 }
 
 impl DeploymentBase {
-    /// HTTPS download URL of the deployment's only artifact. `None` when there is no https link or
-    /// more than one chunk or artifact; then read [`Deployment::chunks`] instead.
+    /// HTTPS download URL of the one artifact whose file name ends with `suffix`, such as
+    /// `".raucb"`. Other files next to it, like signatures or notes, are ignored. `None` when no
+    /// artifact or several match, the match has no https link, or there is more than one chunk;
+    /// then read [`Deployment::chunks`] instead.
     #[must_use]
-    pub fn bundle_url(&self) -> Option<&str> {
-        let [artifact] = self.only_chunk()?.artifacts.as_slice() else {
-            return None;
-        };
-        Some(&artifact.links.download.as_ref()?.href)
+    pub fn bundle_url(&self, suffix: &str) -> Option<&str> {
+        let artifacts = &self.only_chunk()?.artifacts;
+        let mut matches = artifacts.iter().filter(|a| a.filename.ends_with(suffix));
+        match (matches.next(), matches.next()) {
+            (Some(artifact), None) => Some(&artifact.links.download.as_ref()?.href),
+            _ => None,
+        }
     }
 
     /// Version of the deployment's only chunk. `None` when there are several.
@@ -499,7 +503,7 @@ mod tests {
         assert_eq!((artifact.filename.as_str(), artifact.size), ("b.raucb", 3));
         assert_eq!(artifact.hashes.sha256.as_deref(), Some("x"));
         assert_eq!(d.deployment.chunks[0].version, "20261030-abc1234");
-        assert_eq!(d.bundle_url(), Some("https://h/b.raucb"));
+        assert_eq!(d.bundle_url(".raucb"), Some("https://h/b.raucb"));
     }
 
     #[test]
@@ -626,7 +630,45 @@ mod tests {
                 chunks: vec![chunk("os-1"), chunk("app-2")],
             },
         };
-        assert_eq!((d.version(), d.bundle_url()), (None, None));
+        assert_eq!((d.version(), d.bundle_url("")), (None, None));
+    }
+
+    #[test]
+    fn bundle_url_picks_the_one_file_with_the_suffix() {
+        let artifact = |name: &str| Artifact {
+            filename: name.into(),
+            size: 1,
+            hashes: Hashes {
+                sha1: "s".into(),
+                md5: "m".into(),
+                sha256: None,
+            },
+            links: ArtifactLinks {
+                download: Some(Link {
+                    href: format!("https://h/{name}"),
+                }),
+                download_http: None,
+            },
+        };
+        let with = |names: &[&str]| DeploymentBase {
+            id: "5".into(),
+            deployment: Deployment {
+                download: Handling::Forced,
+                update: Handling::Forced,
+                maintenance_window: None,
+                chunks: vec![Chunk {
+                    version: "1".into(),
+                    artifacts: names.iter().map(|n| artifact(n)).collect(),
+                }],
+            },
+        };
+        let url = |names: &[&str]| with(names).bundle_url(".raucb").map(str::to_owned);
+        assert_eq!(
+            url(&["notes.txt", "b.raucb", "b.raucb.sig"]).as_deref(),
+            Some("https://h/b.raucb")
+        );
+        assert_eq!(url(&["a.raucb", "b.raucb"]), None);
+        assert_eq!(url(&["b.raucb.sig"]), None);
     }
 
     #[test]
