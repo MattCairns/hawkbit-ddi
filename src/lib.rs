@@ -162,15 +162,25 @@ pub struct ArtifactLinks {
 
 impl DeploymentBase {
     /// HTTPS download URL of the one artifact whose file name ends with `suffix`, such as
-    /// `".raucb"`. Other files next to it, like signatures or notes, are ignored. `None` when no
-    /// artifact or several match, the match has no https link, or there is more than one chunk;
-    /// then read [`Deployment::chunks`] instead.
+    /// `".raucb"`. Other files next to it, like signatures or notes, are ignored. The `download`
+    /// link is preferred; a `download-http` link is accepted only when its URL is itself https,
+    /// since hawkBit labels links by its own protocol config rather than the URL's real scheme.
+    /// `None` when no artifact or several match, the match has no https link, or there is more
+    /// than one chunk; then read [`Deployment::chunks`] instead.
     #[must_use]
     pub fn bundle_url(&self, suffix: &str) -> Option<&str> {
         let artifacts = &self.only_chunk()?.artifacts;
         let mut matches = artifacts.iter().filter(|a| a.filename.ends_with(suffix));
         match (matches.next(), matches.next()) {
-            (Some(artifact), None) => Some(&artifact.links.download.as_ref()?.href),
+            (Some(artifact), None) => {
+                let links = &artifact.links;
+                links
+                    .download
+                    .as_ref()
+                    .or(links.download_http.as_ref())
+                    .map(|link| link.href.as_str())
+                    .filter(|href| href.starts_with("https://"))
+            }
             _ => None,
         }
     }
@@ -669,6 +679,44 @@ mod tests {
         );
         assert_eq!(url(&["a.raucb", "b.raucb"]), None);
         assert_eq!(url(&["b.raucb.sig"]), None);
+    }
+
+    #[test]
+    fn bundle_url_accepts_https_under_download_http() {
+        let with = |download: Option<&str>, download_http: Option<&str>| DeploymentBase {
+            id: "5".into(),
+            deployment: Deployment {
+                download: Handling::Forced,
+                update: Handling::Forced,
+                maintenance_window: None,
+                chunks: vec![Chunk {
+                    version: "1".into(),
+                    artifacts: vec![Artifact {
+                        filename: "b.raucb".into(),
+                        size: 1,
+                        hashes: Hashes {
+                            sha1: "s".into(),
+                            md5: "m".into(),
+                            sha256: None,
+                        },
+                        links: ArtifactLinks {
+                            download: download.map(|h| Link { href: h.into() }),
+                            download_http: download_http.map(|h| Link { href: h.into() }),
+                        },
+                    }],
+                }],
+            },
+        };
+        let url = |d, h| with(d, h).bundle_url(".raucb").map(str::to_owned);
+        assert_eq!(
+            url(None, Some("https://h/b")).as_deref(),
+            Some("https://h/b")
+        );
+        assert_eq!(url(None, Some("http://h/b")), None);
+        assert_eq!(
+            url(Some("https://h/a"), Some("https://h/b")).as_deref(),
+            Some("https://h/a")
+        );
     }
 
     #[test]
