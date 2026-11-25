@@ -119,6 +119,10 @@ pub enum MaintenanceWindow {
 /// A software module to deploy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chunk {
+    /// Key of the software module's type, such as `os`. Tells the chunks of a deployment apart.
+    pub part: String,
+    /// Name of the software module.
+    pub name: String,
     /// Version of the software module.
     pub version: String,
     /// Artifacts (files) of the software module.
@@ -161,16 +165,46 @@ pub struct ArtifactLinks {
 }
 
 impl DeploymentBase {
+    /// [`Chunk::bundle_url`] of the deployment's only chunk. `None` when there are several; then
+    /// pick one with [`DeploymentBase::chunk`].
+    #[must_use]
+    pub fn bundle_url(&self, suffix: &str) -> Option<&str> {
+        self.only_chunk()?.bundle_url(suffix)
+    }
+
+    /// Version of the deployment's only chunk. `None` when there are several.
+    #[must_use]
+    pub fn version(&self) -> Option<&str> {
+        Some(&self.only_chunk()?.version)
+    }
+
+    /// The one chunk whose `part` is `part`.
+    #[must_use]
+    pub fn chunk(&self, part: &str) -> Option<&Chunk> {
+        let mut matches = self.deployment.chunks.iter().filter(|c| c.part == part);
+        match (matches.next(), matches.next()) {
+            (Some(chunk), None) => Some(chunk),
+            _ => None,
+        }
+    }
+
+    fn only_chunk(&self) -> Option<&Chunk> {
+        match self.deployment.chunks.as_slice() {
+            [chunk] => Some(chunk),
+            _ => None,
+        }
+    }
+}
+
+impl Chunk {
     /// HTTPS download URL of the one artifact whose file name ends with `suffix`, such as
     /// `".raucb"`. Other files next to it, like signatures or notes, are ignored. The `download`
     /// link is preferred; a `download-http` link is accepted only when its URL is itself https,
     /// since hawkBit labels links by its own protocol config rather than the URL's real scheme.
-    /// `None` when no artifact or several match, the match has no https link, or there is more
-    /// than one chunk; then read [`Deployment::chunks`] instead.
+    /// `None` when no artifact or several match, or the match has no https link.
     #[must_use]
     pub fn bundle_url(&self, suffix: &str) -> Option<&str> {
-        let artifacts = &self.only_chunk()?.artifacts;
-        let mut matches = artifacts.iter().filter(|a| a.filename.ends_with(suffix));
+        let mut matches = self.artifacts.iter().filter(|a| a.filename.ends_with(suffix));
         match (matches.next(), matches.next()) {
             (Some(artifact), None) => {
                 let links = &artifact.links;
@@ -181,19 +215,6 @@ impl DeploymentBase {
                     .map(|link| link.href.as_str())
                     .filter(|href| href.starts_with("https://"))
             }
-            _ => None,
-        }
-    }
-
-    /// Version of the deployment's only chunk. `None` when there are several.
-    #[must_use]
-    pub fn version(&self) -> Option<&str> {
-        Some(&self.only_chunk()?.version)
-    }
-
-    fn only_chunk(&self) -> Option<&Chunk> {
-        match self.deployment.chunks.as_slice() {
-            [chunk] => Some(chunk),
             _ => None,
         }
     }
@@ -627,7 +648,9 @@ mod tests {
 
     #[test]
     fn helpers_refuse_to_guess_between_chunks() {
-        let chunk = |v: &str| Chunk {
+        let chunk = |part: &str, v: &str| Chunk {
+            part: part.into(),
+            name: part.into(),
             version: v.into(),
             artifacts: vec![],
         };
@@ -637,10 +660,13 @@ mod tests {
                 download: Handling::Forced,
                 update: Handling::Forced,
                 maintenance_window: None,
-                chunks: vec![chunk("os-1"), chunk("app-2")],
+                chunks: vec![chunk("os", "1"), chunk("app", "2"), chunk("app", "3")],
             },
         };
         assert_eq!((d.version(), d.bundle_url("")), (None, None));
+        assert_eq!(d.chunk("os").map(|c| c.version.as_str()), Some("1"));
+        assert!(d.chunk("app").is_none());
+        assert!(d.chunk("none").is_none());
     }
 
     #[test]
@@ -667,6 +693,8 @@ mod tests {
                 update: Handling::Forced,
                 maintenance_window: None,
                 chunks: vec![Chunk {
+                    part: "os".into(),
+                    name: "os".into(),
                     version: "1".into(),
                     artifacts: names.iter().map(|n| artifact(n)).collect(),
                 }],
@@ -690,6 +718,8 @@ mod tests {
                 update: Handling::Forced,
                 maintenance_window: None,
                 chunks: vec![Chunk {
+                    part: "os".into(),
+                    name: "os".into(),
                     version: "1".into(),
                     artifacts: vec![Artifact {
                         filename: "b.raucb".into(),

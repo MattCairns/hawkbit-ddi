@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.0]
+
+### Added
+
+- `Chunk::part` and `Chunk::name`: the software module's type key and name.
+- `DeploymentBase::chunk(part)` and `Chunk::bundle_url`, for deployments with several modules.
+
+### Changed
+
+- `Chunk` has new public fields, so struct literals must set them.
+- Deserializing a `Chunk` now requires `part` and `name`.
+
+## [0.1.1]
+
+### Changed
+
+- `bundle_url` accepts a `download-http` link when its URL is itself https.
+
 ## [0.1.0]
 
 ### Added
